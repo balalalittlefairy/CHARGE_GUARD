@@ -1,0 +1,37 @@
+.gradle/
+.idea/
+**/build/
+local.properties
+*.iml
+*.jks
+*.keystore
+captures/
+artifacts/
+
+# Local settings and credentials
+.env
+.env.*
+!.env.example
+key.properties
+keystore.properties
+*.p12
+*.pem
+
+# Generated packages and diagnostics
+*.apk
+*.aab
+*.apks
+*.log
+*.hprof
+*.class
+__pycache__/
+*.py[cod]
+
+# Editor and OS files
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.tmp
+*.bak
