@@ -8,6 +8,16 @@ local.properties
 captures/
 artifacts/
 
+# Local development material (kept outside the published source tree)
+/CHANGELOG.md
+/DEVELOPMENT_PLAN.md
+/TESTING.md
+/docs/
+/design/
+/tools/
+/app/src/androidTest/
+/app/src/protocolCheck/
+
 # Local settings and credentials
 .env
 .env.*

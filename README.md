@@ -17,7 +17,7 @@
 ## 开始使用
 
 1. 在米家 App 完成插座配网和账号绑定，把手机充电器接到目标插座。
-2. 从源码构建并安装调试 APK，见[开发指南](docs/DEVELOPMENT.md)。源码仓库不包含预编译 APK。
+2. 从 [GitHub Releases](https://github.com/balalalittlefairy/CHARGE_GUARD/releases/latest) 下载并安装 APK，也可以按下方步骤从源码构建。
 3. 在「设置 → 小米账号」选择与米家一致的地区，使用手机号 / 验证码登录，完成后获取设备并选择目标插座。
 4. 先刷新状态，再手动测试开启和关闭，核对实际插座动作。局域网要求手机与插座网络互通。
 5. 在「保护」页设置两个阈值和路线，点击「保存保护设置」，再到首页「开始保护」。允许通知，并按手机系统要求开放后台运行。
@@ -45,7 +45,7 @@
 
 ## 验证状态与限制
 
-已有记录表明，真实账号登录、设备列表和手动插座开关已验证；云端已验证实时查询和原状态写回，也验证过绑定手机移动数据的请求。**云端实际切换继电器、真实充放电跨阈值和长时间后台场景仍待验收**。覆盖范围见[测试说明](TESTING.md)。
+真实账号登录、设备列表和手动插座开关已有验证；云端已验证实时查询和原状态写回，也验证过绑定手机移动数据的请求。**云端实际切换继电器、真实充放电跨阈值和长时间后台场景仍待验收**。
 
 - 仅面向上述型号，不包含插座配网、局域网自动扫描或 IPv6。
 - 局域网使用家庭私有 IPv4；云端要求插座联网、手机有互联网、会话有效且账号有设备权限。
@@ -54,17 +54,17 @@
 - 小米社区接口变化可能影响兼容性，不绕过 HTTPS 证书校验或登录风控。
 - 运行记录最多保留最近 30 条进程内记录，支持界面重建恢复，不是跨进程持久历史。
 
-## 仓库导航
+## 从源码构建
 
-| 路径 | 内容 |
-| --- | --- |
-| [app/](app/) | Android 应用、JVM 协议检查与仪器测试 |
-| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | 环境配置、构建、模块结构、工作区约定 |
-| [TESTING.md](TESTING.md) | 测试命令、验证状态和真机验收清单 |
-| [DEVELOPMENT_PLAN.md](DEVELOPMENT_PLAN.md) | 当前里程碑与后续工作 |
-| [CHANGELOG.md](CHANGELOG.md) | 版本变更摘要 |
-| [design/ui-prototype/](design/ui-prototype/) | 使用模拟数据的离线 HTML 界面参考 |
-| [tools/reference_vectors.py](tools/reference_vectors.py) | 独立协议测试样例生成器 |
+使用 JDK 17 和 Android SDK 35。通过 Android Studio 打开项目并配置 SDK，或在本机 `local.properties` 中设置 `sdk.dir`。
+
+```powershell
+.\gradlew.bat assembleDebug
+```
+
+macOS / Linux 使用 `./gradlew assembleDebug`。首次构建需要联网下载 Gradle 和依赖；APK 输出至 `app/build/outputs/apk/debug/app-debug.apk`。
+
+GitHub Release 当前提供调试签名 APK。不同签名的包无法直接覆盖安装；卸载会清除本地配置。
 
 ## 开源协议
 
