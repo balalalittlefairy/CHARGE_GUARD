@@ -17,6 +17,7 @@ import java.util.concurrent.Future
 class ChargingMonitorService : Service() {
     companion object {
         const val START = "io.github.chargercontroller.START_PROTECTION"
+        const val RESTORE = "io.github.chargercontroller.RESTORE_PROTECTION"
         const val STOP = "io.github.chargercontroller.STOP_PROTECTION"
         const val RUN_CHANNEL = "charging_running"
         const val RESULT_CHANNEL = "charging_results"
@@ -25,8 +26,8 @@ class ChargingMonitorService : Service() {
         fun requestCheck() { instance?.let { if (it.cycle?.active == true) { it.checkBattery("唤醒复查"); it.scheduleAlarm() } } }
         fun channels(context: Context) {
             context.getSystemService(NotificationManager::class.java).apply {
-                createNotificationChannel(NotificationChannel(RUN_CHANNEL, "充电保护运行", NotificationManager.IMPORTANCE_LOW))
-                createNotificationChannel(NotificationChannel(RESULT_CHANNEL, "充电保护结果", NotificationManager.IMPORTANCE_HIGH))
+                createNotificationChannel(NotificationChannel(RUN_CHANNEL, "电量循环保护运行", NotificationManager.IMPORTANCE_LOW))
+                createNotificationChannel(NotificationChannel(RESULT_CHANNEL, "电量循环保护结果", NotificationManager.IMPORTANCE_HIGH))
             }
         }
     }
@@ -41,6 +42,7 @@ class ChargingMonitorService : Service() {
     private lateinit var wake: PowerManager.WakeLock
     private var registered = false
     private var restoring = false
+    private var waitForRestore = false
     private var restoreOff = false
     private var restoreAttempts = 0
     private var restorePhase: String? = null
@@ -69,15 +71,17 @@ class ChargingMonitorService : Service() {
             return START_NOT_STICKY
         }
         if (cycle?.active == true) return START_STICKY
-        // A null intent is Android restarting an existing task. A force-stop is never bypassed.
-        val restore = intent == null && status.active
+        // Sticky restarts and explicit resume use the saved snapshot, never today's UI draft.
+        // Force-stopped apps receive no boot broadcast; opening the app is a user action.
+        val restore = (intent == null || intent.action == RESTORE) && status.active
         if (intent?.action != START && !restore) { stopSelf(); return START_NOT_STICKY }
+        waitForRestore = restore && (intent?.action == RESTORE || status.resumePending)
         running = true
         getSystemService(NotificationManager::class.java).cancel(2)
-        val initial = notification("正在准备充电保护…", true)
-        if (Build.VERSION.SDK_INT >= 29) startForeground(1, initial, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
-        else startForeground(1, initial)
+        val initial = notification("正在准备电量循环保护…", true)
         try {
+            if (Build.VERSION.SDK_INT >= 29) startForeground(1, initial, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            else startForeground(1, initial)
             val config = credentials.get(if (restore) "protection_device" else "device")?.let(PlugDevice::fromJson)
                 ?: throw UserFacingException("尚未保存目标插座，请先选择设备")
             controlMode = if (restore) status.controlMode else controls.mode
@@ -94,6 +98,8 @@ class ChargingMonitorService : Service() {
             cycle = ChargingCycle(threshold, low)
             credentials.put("protection_device", config.json())
             restoring = true
+            if (waitForRestore) status.resuming("正在恢复上次保护：核对当前电量与插座状态")
+            else status.clearResume()
             publish(if (restoring) "正在核对电量与插座状态" else "准备中：读取手机电量")
             val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED).apply {
                 addAction(Intent.ACTION_POWER_CONNECTED); addAction(Intent.ACTION_POWER_DISCONNECTED)
@@ -150,7 +156,24 @@ class ChargingMonitorService : Service() {
             } }
             handler.post {
                 if (version != generation || cycle?.active != true) return@post
-                releaseWake(); restoring = false
+                releaseWake()
+                val error = outcome.exceptionOrNull()
+                if (waitForRestore && error != null) {
+                    // AUTO may have reached an expired cloud fallback only because Wi-Fi is
+                    // still starting. Valid LAN credentials can recover without that account.
+                    val canWaitForLan = controlMode == ControlMode.AUTO &&
+                        runCatching { MiioLanClient.validate(device!!) }.isSuccess
+                    val rejectedCloud = error is CloudAuthException || error is CloudPermissionException
+                    if (rejectedCloud && !canWaitForLan || error is IllegalArgumentException || error is InterruptedException) {
+                        fail(safeFailure(error)); return@post
+                    }
+                    val message = "恢复等待：${safeFailure(error)}；30 秒后重新确认，尚未发送开关命令"
+                    status.resuming(message)
+                    getSystemService(NotificationManager::class.java).notify(1, notification(routeMessage(message), true))
+                    handler.postDelayed({ if (version == generation && cycle?.active == true && restoring) restoreTask() }, 30_000)
+                    return@post
+                }
+                restoring = false; waitForRestore = false; status.clearResume()
                 val command = cycle!!.recover(lastPercent, outcome.getOrNull()?.power, restoreOff,
                     restoreAttempts, restorePhase, restoreRound)
                 if (command != Command.NONE) execute(command)
@@ -203,8 +226,8 @@ class ChargingMonitorService : Service() {
     private fun describe(c: ChargingCycle): String = when (c.phase) {
         Phase.PREPARING -> "准备中：等待有效电量"
         Phase.TURNING_ON -> "正在开启并读回确认（${c.attempts}/3）"
-        Phase.MONITORING -> "循环保护 · 监测中：${c.percent?.let { "$it%" } ?: "电量未知"} → ${c.threshold}% 自动断电"
-        Phase.WAITING_LOW -> "循环保护 · 插座已确认关闭；${c.percent?.let { "当前 $it%，" } ?: ""}电量 ≤ ${c.lowerThreshold}% 自动开启"
+        Phase.MONITORING -> "电量循环保护 · 监测中：${c.percent?.let { "$it%" } ?: "电量未知"} → ${c.threshold}% 自动断电"
+        Phase.WAITING_LOW -> "电量循环保护 · 插座已确认关闭；${c.percent?.let { "当前 $it%，" } ?: ""}电量 ≤ ${c.lowerThreshold}% 自动开启"
         Phase.TURNING_OFF -> "正在断电并读回确认（${c.attempts}/3）"
         Phase.WAIT_RETRY_ON -> "开启未确认（本轮 3 次已用尽）；${c.percent}% · 电量 ≤ ${c.nextRetryPercent}% 再尝试，保护仍在运行"
         Phase.WAIT_RETRY_OFF -> "断电未确认（本轮 3 次已用尽）；${c.percent}% · ${if ((c.nextRetryPercent ?: 100) < 100) "电量 ≥ ${c.nextRetryPercent}% 再尝试" else "等待电量变化"}，到 100% 仍未确认则结束并提醒"
@@ -241,6 +264,7 @@ class ChargingMonitorService : Service() {
     private fun finishCycle(rawMessage: String, success: Boolean, showResult: Boolean = true) {
         val message = routeMessage(rawMessage)
         generation++; handler.removeCallbacksAndMessages(null); future?.cancel(true)
+        status.clearResume()
         running = false
         cancelAlarm()
         cycle?.let { status.save(it, message) }
@@ -254,7 +278,7 @@ class ChargingMonitorService : Service() {
     private fun notification(message: String, ongoing: Boolean, success: Boolean = false): Notification {
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         val builder = Notification.Builder(this, if (ongoing) RUN_CHANNEL else RESULT_CHANNEL)
-            .setSmallIcon(R.drawable.ic_notification).setContentTitle(if (ongoing) "充电保护" else if (success) "已确认断电" else "充电保护需要检查")
+            .setSmallIcon(R.drawable.ic_notification).setContentTitle(if (ongoing) "电量循环保护" else if (success) "已确认断电" else "电量循环保护需要检查")
             .setContentText(message).setStyle(Notification.BigTextStyle().bigText(message))
             .setContentIntent(open).setOngoing(ongoing).setAutoCancel(!ongoing).setOnlyAlertOnce(ongoing)
         if (ongoing) {

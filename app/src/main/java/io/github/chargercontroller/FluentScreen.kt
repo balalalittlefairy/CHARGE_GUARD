@@ -50,8 +50,9 @@ internal class FluentScreen(private val activity: Activity, low: Int, high: Int,
     private val gauge = BatteryGauge(activity)
     private val homeDevice = label("选择目标插座",12)
     private val badge = label("保护未启动",11,Fluent.muted)
-    private val summaryTitle = label("尚未开始充电保护",14,Fluent.ink,true)
+    private val summaryTitle = label("尚未开始电量循环保护",14,Fluent.ink,true)
     private val summaryDetail = label("",12).apply{maxLines=2;ellipsize=android.text.TextUtils.TruncateAt.END}
+    private val onboardingBanner = button("首次设置还没完成 · 继续设置","onboarding-resume",false).apply { visibility=View.GONE;setTextColor(Fluent.blue) }
     private val guardButton = button("开始保护","toggle-guard",true)
     private val stopEdit = button("停止保护","stop",false)
     private val runningHint = LinearLayout(activity)
@@ -147,6 +148,7 @@ internal class FluentScreen(private val activity: Activity, low: Int, high: Int,
     }
     private fun buildHome() {
         val body=page("home","我的充电")
+        body.addView(onboardingBanner,LinearLayout.LayoutParams(-1,-2).apply { topMargin=dp(14) })
         homeDevice.setOnClickListener{action("devices")};homeDevice.isFocusable=true
         val header=body.getChildAt(0) as LinearLayout
         (header.getChildAt(0) as LinearLayout).addView(homeDevice,LinearLayout.LayoutParams(-2,dp(27)))
@@ -193,7 +195,7 @@ internal class FluentScreen(private val activity: Activity, low: Int, high: Int,
         operationStatus.maxLines=1;operationStatus.ellipsize=android.text.TextUtils.TruncateAt.END;val latestCopy=column();latestCopy.addView(operationStatus);latestCopy.addView(latestTime,LinearLayout.LayoutParams(-1,-2).apply{topMargin=dp(3)});latest.addView(latestCopy,LinearLayout.LayoutParams(0,-2,1f));latest.addView(icon("chevron"),LinearLayout.LayoutParams(dp(14),dp(14)));body.addView(latest)
     }
     private fun buildProtection() {
-        val body=page("protection","保护设置")
+        val body=page("protection","电量循环保护")
         runningHint.apply{gravity=Gravity.CENTER_VERTICAL;setPadding(dp(10),dp(8),dp(10),dp(8));background=Fluent.surface(activity,Fluent.soft,6,null)}
         runningHint.addView(label("保护运行中，停止后可修改设置。",11),LinearLayout.LayoutParams(0,-2,1f))
         stopEdit.textSize=11f;runningHint.addView(stopEdit,LinearLayout.LayoutParams(dp(80),dp(44)))
@@ -245,6 +247,7 @@ internal class FluentScreen(private val activity: Activity, low: Int, high: Int,
         val devices=card(body).apply{setPadding(dp(14),0,dp(14),0)};menu(devices,"目标插座","选择或编辑插座","plug","devices");menu(devices,"通知与后台","让锁屏后的保护继续运行","bell","permissions",side=permissionSide)
         body.addView(label("记录与维护",11),LinearLayout.LayoutParams(-1,-2).apply{topMargin=dp(20)})
         val maintenance=card(body).apply{setPadding(dp(14),0,dp(14),0)};menu(maintenance,"运行记录","查看控制结果、重试与异常","history","logs");menu(maintenance,"高级配置","IP、设备凭据与连接测试","sliders","advanced")
+        menu(maintenance,"首次使用引导","查看连接与保护设置","info","onboarding-resume")
         body.addView(label("关于",11),LinearLayout.LayoutParams(-1,-2).apply{topMargin=dp(20)})
         val about=card(body).apply{setPadding(dp(14),0,dp(14),0)};menu(about,"关于充电守护","","info","about",side=label("v${activity.packageManager.getPackageInfo(activity.packageName,0).versionName}",10))
     }
@@ -266,10 +269,12 @@ internal class FluentScreen(private val activity: Activity, low: Int, high: Int,
         body.addView(filters,LinearLayout.LayoutParams(-1,-2).apply{topMargin=dp(20)})
         body.addView(logList,LinearLayout.LayoutParams(-1,-2).apply{topMargin=dp(22)})
     }
+    fun onboardingPending(pending:Boolean) { onboardingBanner.visibility=if(pending)View.VISIBLE else View.GONE }
+    fun onboardingVisible(visible:Boolean) { scaffold.visibility=if(visible)View.GONE else View.VISIBLE; if(visible)toastView.visibility=View.GONE }
     fun showLogs(filter:String="全部") {this.filter=filter;show("logs")}
-    fun updateAccount(connected:Boolean,region:String,expired:Boolean) {
-        profileTitle.text=if(connected)"小米账号已连接" else "连接小米账号"
-        profileDetail.text=if(!connected)"登录后可使用云端控制" else "${if(region=="cn")"中国大陆" else region} · ${if(expired)"会话已失效，请重新登录" else "云端会话已保存"}"
+    fun updateAccount(connected:Boolean,foreign:Boolean,expired:Boolean) {
+        profileTitle.text=if(foreign)"需要重新登录" else if(connected)"小米账号已连接" else "连接小米账号"
+        profileDetail.text=if(!connected)"登录后可使用云端控制" else if(foreign)"仅支持中国大陆，请重新登录" else "中国大陆 · ${if(expired)"会话已失效，请重新登录" else "云端会话已保存"}"
     }
     fun toast(message:String){toastHandler.removeCallbacks(hideToast);toastView.text=message;toastView.visibility=View.VISIBLE;toastView.announceForAccessibility(message);toastHandler.postDelayed(hideToast,2300)}
     fun dispose(){toastHandler.removeCallbacksAndMessages(null)}
@@ -314,7 +319,7 @@ internal class FluentScreen(private val activity: Activity, low: Int, high: Int,
         badge.text=if(active)"保护运行中" else "保护未启动";badge.setTextColor(if(active)Fluent.blue else Fluent.muted)
         guardButton.text=if(active)"停止保护" else "开始保护";guardButton.isEnabled=active||!busy
         guardButton.setTextColor(if(active)Fluent.ink else Color.WHITE);guardButton.background=Fluent.surface(activity,if(active)Color.WHITE else Fluent.blue,6,if(active)Color.rgb(209,209,209) else null)
-        summaryTitle.text=if(!active) {if(phase=="FAILED")"保护需要检查" else "尚未开始充电保护"} else when(phase){"WAITING_LOW"->"等待电量降至开启阈值";"MONITORING"->"监测电量，达到阈值自动断电";"RETRY_ON","RETRY_OFF","WAIT_RETRY_ON","WAIT_RETRY_OFF"->"结果未确认，等待重试";else->"正在连接并确认插座状态"}
+        summaryTitle.text=if(!active) {if(phase=="FAILED")"保护需要检查" else "尚未开始电量循环保护"} else when(phase){"WAITING_LOW"->"等待电量降至开启阈值";"MONITORING"->"监测电量，达到阈值自动断电";"RETRY_ON","RETRY_OFF","WAIT_RETRY_ON","WAIT_RETRY_OFF"->"结果未确认，等待重试";else->"正在连接并确认插座状态"}
         summaryDetail.text=if(active)message.substringBefore('\n') else if(phase in listOf("FAILED","INTERRUPTED"))message.substringBefore('\n') else "电量 ≤ $low% 开启，≥ $high% 关闭"
         lowSummary.text="$low%";highSummary.text="$high%"
         lockNote.visibility=if(active)View.VISIBLE else View.GONE
@@ -335,8 +340,8 @@ internal class FluentScreen(private val activity: Activity, low: Int, high: Int,
             first.contains("已读回确认插座开启")->"插座开启已确认"
             first.contains("本轮 3 次已用尽")&&first.contains("开启")->"插座开启未确认"
             first.contains("本轮 3 次已用尽")->"插座关闭未确认"
-            first.startsWith("循环保护 · 插座已确认关闭")->"等待低电量，插座已关闭"
-            first.startsWith("循环保护 · 监测中")->"正在监测充电电量"
+            first.startsWith("电量循环保护 · 插座已确认关闭")->"等待低电量，插座已关闭"
+            first.startsWith("电量循环保护 · 监测中")->"正在监测充电电量"
             else->first.substringBefore('；').take(26)
         }
         return Event(time,title,message,category,route)

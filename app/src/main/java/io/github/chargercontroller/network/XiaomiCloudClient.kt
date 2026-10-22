@@ -12,7 +12,7 @@ class XiaomiCloudClient(private val request: CloudRequest, private val pause: (L
     companion object {
         private val sequence = AtomicInteger(1)
         fun validate(device: PlugDevice) {
-            require(device.model == "cuco.plug.v3") { "本版仅支持 cuco.plug.v3" }
+            DeviceSupport.requireSupported(device)
             require(device.did.matches(Regex("[0-9]{1,32}"))) { "云端控制缺少有效设备 DID，请登录并从设备列表重新选择插座" }
         }
     }

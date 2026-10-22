@@ -6,7 +6,7 @@ import io.github.chargercontroller.data.*
 class PlugController(private val mode: ControlMode, private val local: () -> PlugClient,
     private val cloud: () -> PlugClient, private val onAttempt: (ControlRoute, String?) -> Unit = { _, _ -> }) : PlugClient {
     private fun perform(device: PlugDevice, on: Boolean?): PlugStatus {
-        require(device.model == "cuco.plug.v3") { "本版仅支持 cuco.plug.v3" }
+        DeviceSupport.requireSupported(device)
         var fallingBack = false
         val result = ControlRouting.run(mode, {
             if (mode == ControlMode.AUTO) {

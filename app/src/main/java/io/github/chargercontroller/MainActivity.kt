@@ -35,12 +35,16 @@ import java.util.Locale
 import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
+    private lateinit var onboardingStore: OnboardingStore
+    internal var onboarding: OnboardingScreen? = null
+        private set
+    private var onboardingListError: String? = null
+    private var lastTaskError: String? = null
     private lateinit var store: CredentialStore
     private var account = XiaomiAccountRepository()
     private var session: CloudSession? = null
     private var device: PlugDevice? = null
     private var pendingLogin: LoginStep? = null
-    private var selectedRegion = "cn"
     private val worker = Executors.newSingleThreadExecutor()
     private val logs = ArrayDeque<String>()
     private var busy = false
@@ -75,8 +79,10 @@ class MainActivity : Activity() {
     internal var currentSheet: FluentSheet? = null
         private set
     private var availableDevices = emptyList<PlugDevice>()
+    private var devicesLoaded = false
     private var permissionNotification: FluentToggle? = null
     private var permissionBackground: FluentToggle? = null
+    private var bootRecovery: FluentToggle? = null
     private var sheetResult: TextView? = null
     private val ink = Fluent.ink
     private val accent = Fluent.blue
@@ -89,12 +95,12 @@ class MainActivity : Activity() {
         store = CredentialStore(this)
         protection = ProtectionStore(this)
         controls = ControlPreferences(this)
+        onboardingStore = OnboardingStore(this)
         ChargingMonitorService.channels(this)
         var restoreError: Exception? = null
         try {
             session = store.get("session")?.let(CloudSession::fromJson)
             device = store.get("device")?.let(PlugDevice::fromJson)
-            selectedRegion = session?.region ?: "cn"
         } catch (e: Exception) { restoreError = e }
         ui = FluentScreen(this, protection.lowerThreshold, protection.threshold, controls.mode, ::handleUiAction)
         accountStatus = ui.accountStatus; deviceStatus = ui.deviceStatus; result = ui.result
@@ -103,7 +109,7 @@ class MainActivity : Activity() {
         thresholdInput = ui.highInput; lowerThresholdInput = ui.lowInput
         setContentView(ui.root)
         if (Build.VERSION.SDK_INT >= 33) onBackInvokedDispatcher.registerOnBackInvokedCallback(
-            android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT) { if (!ui.back()) finish() }
+            android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT) { handleBack() }
         ui.root.setOnApplyWindowInsetsListener { view, insets ->
             view.setPadding(insets.systemWindowInsetLeft, insets.systemWindowInsetTop, insets.systemWindowInsetRight, insets.systemWindowInsetBottom)
             insets
@@ -119,8 +125,142 @@ class MainActivity : Activity() {
         }
         restoreError?.let { record(safeMessage(it)) }
         updateLabels(); updateProtection()
+        val info = packageManager.getPackageInfo(packageName,0)
+        val first = onboardingStore.consumeFirstLaunch(info.lastUpdateTime > info.firstInstallTime)
+        if (first || savedInstanceState?.getBoolean("onboarding_visible") == true) showOnboarding()
+        ui.onboardingPending(onboardingStore.pending)
+    }
+    private fun onboardingModel(): OnboardingScreen.Model {
+        val connected = session?.let { MainlandAccount.accepts(it) } == true && !controls.cloudExpired
+        return OnboardingScreen.Model(connected, pendingLogin != null, device?.name, device?.ip,
+            connected && !onboardingStore.manual && device?.did?.matches(Regex("[0-9]{1,32}")) == true,
+            availableDevices.mapIndexedNotNull { index, picked ->
+                if (!DeviceSupport.supports(picked)) null else OnboardingScreen.Device(index, picked.name, device == picked)
+            }, devicesLoaded, onboardingListError, notificationsAllowed(),
+            getSystemService(android.os.PowerManager::class.java).isIgnoringBatteryOptimizations(packageName),
+            protection.resumeOnBoot, busy, ChargingMonitorService.running)
+    }
+    private fun showOnboarding() {
+        if (onboarding != null) return
+        currentSheet?.dismiss()
+        val guide = OnboardingScreen(this, onboardingStore, onboardingModel(), ::onboardingAction)
+        onboarding = guide
+        ui.onboardingVisible(true)
+        ui.root.addView(guide.root, FrameLayout.LayoutParams(-1,-1))
+    }
+    private fun hideOnboarding() {
+        currentSheet?.dismiss()
+        onboarding?.root?.let(ui.root::removeView); onboarding = null
+        ui.onboardingVisible(false); ui.show("home"); updateLabels(); updateProtection()
+    }
+    private fun handleBack() {
+        if (currentSheet?.isShowing == true) { currentSheet?.dismiss(); return }
+        if (onboarding != null) { if (!busy && onboarding?.back() == false) skipOnboarding(); return }
+        if (!ui.back()) finish()
+    }
+    private fun skipOnboarding() {
+        sheet("setup-skip", "稍后再完成设置？") { panel ->
+            panel.note("可以先进入首页。未完成的连接和授权会保留为待办，补齐之前不会启动充电保护。")
+            panel.action("继续设置", "setup-keep") { panel.dismiss() }
+            panel.action("先进入首页", "setup-exit", false) { panel.dismiss(); hideOnboarding() }
+        }
+    }
+    private fun onboardingAction(key: String) {
+        if (busy || ChargingMonitorService.running || protection.active) { record("请先停止保护并等待当前操作完成"); return }
+        if (key.startsWith("setup-select-")) {
+            val picked = availableDevices.getOrNull(key.removePrefix("setup-select-").toIntOrNull() ?: -1) ?: return
+            try { DeviceSupport.requireSupported(picked); PlugAccess.validate(this, picked) }
+            catch (e: Exception) { record(safeMessage(e)); return }
+            task("加密保存设备凭据", { store.put("device", picked.json()); picked }) {
+                device = it; onboardingStore.manual = false
+                result.text = "状态：配置已更新，待查询"; ui.showPlug(null,"配置已更新，待查询"); updateLabels()
+            }
+            return
+        }
+        if (key.startsWith("setup-mode-")) {
+            val mode = ControlMode.entries.firstOrNull { it.name == key.removePrefix("setup-mode-") } ?: return
+            if (mode == ControlMode.CLOUD && !onboardingModel().cloudReady) { record("云端需要有效账号会话和设备 DID"); return }
+            onboardingStore.mode = mode; onboarding?.go("rules"); return
+        }
+        when(key) {
+            "setup-back" -> if (onboarding?.back() == false) skipOnboarding()
+            "setup-skip" -> skipOnboarding()
+            "setup-login" -> smsLogin()
+            "setup-verify" -> pendingLogin?.let(::loginStep) ?: smsLogin()
+            "setup-account" -> onboarding?.go("account")
+            "setup-import" -> deviceDialog(if (onboardingStore.manual) device else null)
+            "setup-cloud-list" -> { onboardingStore.manual = false; loadDevices() }
+            "setup-refresh" -> loadDevices()
+            "setup-review-rules" -> onboarding?.go("rules")
+            "setup-next" -> when(onboarding?.page) {
+                "welcome" -> onboarding?.go("account")
+                "account" -> {
+                    if (!onboardingModel().connected && !(onboardingStore.manual && device != null)) return
+                    onboarding?.go("device")
+                    if (!onboardingStore.manual && !devicesLoaded) loadDevices()
+                }
+                "device" -> {
+                    if (device == null || !onboardingStore.manual && !onboardingModel().devices.any { it.selected }) return
+                    onboarding?.go("rules")
+                }
+                "rules" -> {
+                    val low = onboardingStore.low.toIntOrNull(); val high = onboardingStore.high.toIntOrNull()
+                    if (low == null || high == null || high !in 2..100 || low !in 1 until high) { record("请输入有效的开启、关闭电量阈值"); return }
+                    val config = device ?: run { record("请先选择或导入目标插座"); return }
+                    try {
+                        PlugAccess.validate(this, config, onboardingStore.mode)
+                        if (onboardingStore.mode == ControlMode.CLOUD) {
+                            val saved = session ?: throw UserFacingException("云端控制需要登录小米账号")
+                            MainlandAccount.requireSession(saved)
+                            if (controls.cloudExpired) throw CloudAuthException()
+                        }
+                        protection.configure(high,low); controls.mode = onboardingStore.mode
+                        onboardingStore.savedRules(); ui.restoreDraft(low.toString(),high.toString(),controls.mode,false); ui.saved(low,high)
+                        onboarding?.go("permissions"); updateLabels(); updateProtection()
+                    } catch(e: Exception) { record(safeMessage(e)) }
+                }
+                "permissions" -> {
+                    if (device == null || !onboardingStore.rulesSaved) { onboarding?.go("rules"); return }
+                    onboardingStore.complete(); onboarding?.go("complete"); ui.onboardingPending(false)
+                }
+                "complete" -> hideOnboarding()
+            }
+            "setup-notifications" -> {
+                if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+                    (!onboardingStore.notificationAsked || shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS))) {
+                    onboardingStore.notificationAsked = true
+                    requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS),81)
+                } else startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE,packageName))
+            }
+            "setup-background" -> onboardingBackground()
+            "setup-boot" -> { protection.resumeOnBoot = !protection.resumeOnBoot; updateLabels() }
+        }
+    }
+    private fun onboardingBackground() {
+        sheet("setup-background", "后台运行设置") { panel ->
+            val unlimited = getSystemService(android.os.PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+            panel.note("不同手机的系统入口不同。返回引导后会检查实际电池限制状态。")
+            panel.row("电池使用策略", if(unlimited)"无限制" else "系统默认")
+            panel.action(if(unlimited)"查看电池设置" else "设为无限制", "setup-battery-settings", false) {
+                runCatching { startActivity(if(unlimited) Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                    else Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,android.net.Uri.parse("package:$packageName"))) }
+                    .onFailure { record("请在系统应用设置中调整电池策略") }
+            }
+            panel.row("系统自启动", "请在系统中确认")
+            panel.action("系统应用设置", "setup-system-settings", false) {
+                runCatching { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,android.net.Uri.parse("package:$packageName"))) }
+                    .onFailure { record("请在手机系统设置中允许本 App 自启动") }
+            }
+            panel.note("App 无法读取所有厂商的自启动许可；返回页面不代表系统已经允许自启动。")
+            panel.action("返回引导", "setup-background-done") { panel.dismiss(); updateLabels() }
+        }
     }
     private fun handleUiAction(key: String) {
+        if (key == "onboarding-resume") {
+            if (protection.active || ChargingMonitorService.running || busy) { record("请先停止保护并等待当前操作完成"); return }
+            if (!onboardingStore.pending) onboardingStore.review(protection.lowerThreshold, protection.threshold, controls.mode, device != null && device?.did.isNullOrBlank())
+            showOnboarding(); return
+        }
         if (key == "stop" || key == "toggle-guard" && ChargingMonitorService.running) { stopProtection(); return }
         if (key == "logs") { ui.showLogs(); return }
         if (key == "account") { accountDialog(); return }
@@ -137,7 +277,7 @@ class MainActivity : Activity() {
             }
             return
         }
-        if (ChargingMonitorService.running) { record("请先停止充电保护，再修改配置或手动控制"); return }
+        if (ChargingMonitorService.running) { record("请先停止电量循环保护，再修改配置或手动控制"); return }
         if (busy) { record("已有操作进行中，请稍候"); return }
         when (key) {
             "toggle-guard" -> if (ui.dirty) { ui.show("protection"); record("请先保存保护设置，再开始保护") } else startProtection()
@@ -158,7 +298,11 @@ class MainActivity : Activity() {
     }
     private fun stopProtection() {
         if (ChargingMonitorService.running) startService(Intent(this, ChargingMonitorService::class.java).setAction(ChargingMonitorService.STOP))
-        else { if (protection.active) protection.interrupt(); updateProtection(); record("当前没有运行中的保护任务") }
+        else {
+            val pending = protection.active
+            if (pending) protection.interrupt()
+            updateProtection(); record(if (pending) "已停止上次保护，不再自动恢复" else "当前没有运行中的保护任务")
+        }
     }
     private fun sheet(kind: String, title: String, secret: Boolean = false, build: (FluentSheet) -> Unit): FluentSheet {
         currentSheet?.dismiss()
@@ -175,14 +319,16 @@ class MainActivity : Activity() {
     private fun accountDialog() {
         sheet("account", "小米账号") { panel ->
             val saved = session
-            panel.centered("user", if (saved == null) "连接小米账号" else "账号已连接",
+            val foreign = saved != null && !MainlandAccount.accepts(saved)
+            panel.centered("user", if (saved == null) "连接小米账号" else if (foreign) "需要重新登录" else "账号已连接",
                 if (saved == null) "使用手机号与验证码完成登录\n即可使用云端备选控制"
-                else "${if (saved.region == "cn") "中国大陆" else saved.region} · ${if (controls.cloudExpired) "会话已失效，请重新登录" else "云端会话已保存"}\n设备凭据已安全保存")
+                else if (foreign) MainlandAccount.LOGIN_REQUIRED
+                else "中国大陆 · ${if (controls.cloudExpired) "会话已失效，请重新登录" else "云端会话已保存"}\n设备凭据已安全保存")
             panel.note(if (saved == null) "将在小米官方网页完成登录，不保存账号密码。" else "账号会话已加密保存，局域网与云端共用当前目标插座。")
-            if (saved == null) panel.action("手机号 / 验证码登录", "sms-login") { editableAction { panel.dismiss(); smsLogin() } }
-            else panel.action("退出登录", "logout", false) { editableAction {
+            if (saved == null || foreign || controls.cloudExpired) panel.action("手机号 / 验证码登录", "sms-login") { editableAction { panel.dismiss(); smsLogin() } }
+            if (saved != null) panel.action("退出登录", "logout", false) { editableAction {
                 panel.dismiss(); task("退出小米账号", { store.put("session", null) }) {
-                    session = null; pendingLogin = null; account = XiaomiAccountRepository(); availableDevices = emptyList(); controls.cloudExpired = false; clearWebCookies(); updateLabels()
+                    session = null; pendingLogin = null; account = XiaomiAccountRepository(); availableDevices = emptyList(); devicesLoaded = false; controls.cloudExpired = false; clearWebCookies(); updateLabels()
                 }
             } }
             panel.action("登录与设备管理", "account-options", false) { editableAction { accountOptions() } }
@@ -191,37 +337,24 @@ class MainActivity : Activity() {
     }
     private fun accountOptions() {
         sheet("account-options", "登录与设备管理") { panel ->
-            panel.row("账号地区", regionLabel(selectedRegion))
-            panel.action("更改地区", "account-region", false) { editableAction { regionDialog() } }
+            panel.row("米家云服务地区", MainlandAccount.REGION_LABEL)
             panel.action("手机号 / 验证码登录", "sms-login") { editableAction { panel.dismiss(); smsLogin() } }
-            panel.actions(panel.button("密码登录（备用）", "password-login", false) { editableAction { panel.dismiss(); loginDialog() } },
-                panel.button("继续身份验证", "resume-login", false) { editableAction { panel.dismiss(); pendingLogin?.let(::loginStep) ?: record("没有待处理的验证，请先登录") } })
+            panel.action("继续身份验证", "resume-login", false) { editableAction { panel.dismiss(); pendingLogin?.let(::loginStep) ?: record("没有待处理的验证，请先登录") } }
             panel.action("获取 / 刷新设备列表", "load-devices", false) { editableAction { panel.dismiss(); loadDevices() } }
-        }
-    }
-    private fun regionLabel(region: String) = mapOf("cn" to "中国大陆", "de" to "欧洲", "i2" to "印度", "ru" to "俄罗斯", "sg" to "新加坡", "us" to "美国")[region] ?: region
-    private fun regionDialog() {
-        sheet("region", "账号地区") { panel ->
-            panel.note("请选择与米家相同的地区。地区用于登录和获取设备列表。")
-            XiaomiAccountRepository.REGIONS.forEach { region ->
-                panel.action("${if (region == selectedRegion) "✓  " else ""}${regionLabel(region)} · $region", "region-$region", false) {
-                    editableAction { selectedRegion = region; accountDialog() }
-                }
-            }
         }
     }
     private fun devicesDialog() {
         sheet("devices", "目标插座") { panel ->
             panel.note("选择充电器实际连接的插座。" + if (ChargingMonitorService.running) "保护运行中，请先停止保护再切换设备。" else "")
-            val devices = (availableDevices + listOfNotNull(device)).distinctBy { it.did.ifBlank { it.name + it.ip } }
-            if (devices.isEmpty()) panel.note("尚未选择插座，请从小米账号获取设备列表，或手动导入设备凭据。")
+            val devices = DeviceSupport.filter(availableDevices + listOfNotNull(device)).distinctBy { it.did.ifBlank { it.name + it.ip } }
+            if (devices.isEmpty() || devicesLoaded && availableDevices.isEmpty()) panel.note("未找到支持的设备。仅支持米家智能插座 3（ZNCZ301KK）；可手动导入 IP / Token。")
             devices.forEachIndexed { index, picked ->
                 val chosen = device?.let { it.did == picked.did && it.name == picked.name && it.ip == picked.ip } == true
-                panel.device(picked.name, if (picked.model == "cuco.plug.v3") "米家智能插座 3 · ${if (chosen) "当前目标" else "状态待查询"}" else "${picked.model} · 本版不支持",
-                    chosen, picked.model == "cuco.plug.v3", "device-choice-$index") {
+                panel.device(picked.name, "米家智能插座 3 · ${if (chosen) "当前目标" else "状态待查询"}",
+                    chosen, DeviceSupport.supports(picked), "device-choice-$index") {
                     editableAction {
                         if (chosen && picked == device) { panel.dismiss(); return@editableAction }
-                        try { PlugAccess.validate(this, picked) } catch (e: Exception) { deviceDialog(picked); return@editableAction }
+                        try { DeviceSupport.requireSupported(picked); PlugAccess.validate(this, picked) } catch (e: Exception) { deviceDialog(picked); return@editableAction }
                         panel.dismiss(); task("加密保存设备凭据", { store.put("device", picked.json()); picked }) {
                             device = it; result.text = "状态：配置已更新，待查询"; ui.showPlug(null, "配置已更新，待查询"); updateLabels()
                         }
@@ -273,6 +406,7 @@ class MainActivity : Activity() {
         }
     }
     override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("onboarding_visible", onboarding != null)
         if (::ui.isInitialized) {
             outState.putString("ui_page", ui.selectedPage); outState.putString("ui_low", lowerThresholdInput.text.toString())
             outState.putString("ui_high", thresholdInput.text.toString()); outState.putString("ui_mode", ui.selectedMode.name)
@@ -281,11 +415,14 @@ class MainActivity : Activity() {
         super.onSaveInstanceState(outState)
     }
     @Deprecated("Activity back dispatch")
-    override fun onBackPressed() { if (!ui.back()) super.onBackPressed() }
+    override fun onBackPressed() { handleBack() }
     private fun updateProtection() {
         if (!::protectionStatus.isInitialized) return
         val active = ChargingMonitorService.running
-        val message = if (protection.active && !active) "上次保护未在运行，请重新开始" else protection.message
+        onboarding?.update(onboardingModel())
+        bootRecovery?.isEnabled = !active && !busy
+        val message = protection.resumeMessage.takeIf { protection.active && it.isNotBlank() }
+            ?: if (protection.active && !active) "上次保护未在运行，请重新开始" else protection.message
         val time = protection.updatedAt.takeIf { it > 0 }?.let { SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(Date(it)) }
         protectionStatus.text = listOfNotNull(message, time?.let { "最近更新：$it" },
             protection.sampledAt.takeIf { it > 0 }?.let { "电量复查：${SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(it))} · ${protection.sampleSource}" },
@@ -293,8 +430,8 @@ class MainActivity : Activity() {
         updateRouteLabel()
         thresholdInput.isEnabled = !active
         lowerThresholdInput.isEnabled = !active
-        ui.updateState(active, busy, if (protection.active && !active) "INTERRUPTED" else protection.phase, message, protection.lowerThreshold, protection.threshold)
-        if (currentSheet?.kind in listOf("account", "account-options", "advanced", "devices", "edit-device", "password-login", "region")) currentSheet?.busy(active || busy)
+        ui.updateState(active, busy, if (active && protection.resumePending) "PREPARING" else if (protection.active && !active) "INTERRUPTED" else protection.phase, message, protection.lowerThreshold, protection.threshold)
+        if (currentSheet?.kind in listOf("account", "account-options", "advanced", "devices", "edit-device", "verification")) currentSheet?.busy(active || busy)
         val event = "${protection.phase}:${protection.updatedAt}"
         if (protection.updatedAt > 0 && event != lastProtectionEvent) {
             lastProtectionEvent = event
@@ -342,6 +479,11 @@ class MainActivity : Activity() {
     }
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 81) {
+            updateLabels()
+            if (!notificationsAllowed()) record("通知尚未开启，可稍后在通知与后台设置中允许，当前不会启动保护")
+            return
+        }
         if (requestCode == 80) {
             val threshold = pendingThreshold; pendingThreshold = null
             val low = pendingLowerThreshold; pendingLowerThreshold = null
@@ -366,7 +508,21 @@ class MainActivity : Activity() {
                     Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, android.net.Uri.parse("package:$packageName"))) }
                     .onFailure { record("请在系统设置中打开本 App 的电池选项") }
             }
-            panel.note("点击开关前往系统授权，返回后显示实际权限状态。部分小米手机还需在系统设置中开启自启动，并将省电策略设为无限制。")
+            bootRecovery = panel.toggle("开机恢复保护", "开机首次解锁后，恢复上次运行中的保护", protection.resumeOnBoot, "permission-boot-restore") {
+                editableAction {
+                    protection.resumeOnBoot = !protection.resumeOnBoot
+                    bootRecovery?.checked = protection.resumeOnBoot
+                }
+            }.apply { isEnabled = !ChargingMonitorService.running && !busy }
+            panel.note("关闭前正在保护才恢复；已停止的任务不会自动开启。恢复会重新核对电量和插座状态，不强行还原旧开关状态。")
+            if (protection.active && !ChargingMonitorService.running) panel.action("停止上次保护", "cancel-pending-restore", false) {
+                editableAction { stopProtection(); panel.dismiss() }
+            }
+            panel.action("系统应用设置", "system-app-settings", false) {
+                runCatching { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:$packageName"))) }
+                    .onFailure { record("请在手机系统设置中允许本 App 自启动") }
+            }
+            panel.note("点击通知和后台开关前往系统授权，返回后显示实际权限状态。部分小米手机还需在系统设置中开启自启动，并将省电策略设为无限制。")
             panel.action("完成", "permissions-done") { panel.dismiss() }
         }
     }
@@ -374,8 +530,11 @@ class MainActivity : Activity() {
         super.onResume()
         if (::protection.isInitialized) {
             protection.prefs.registerOnSharedPreferenceChangeListener(statusListener)
+            if (onboarding == null && protection.active && !ChargingMonitorService.running) ProtectionBootReceiver.resume(this)
             updateLabels(); updateProtection()
             if (currentSheet?.kind == "permissions") {
+                bootRecovery?.checked = protection.resumeOnBoot
+                bootRecovery?.isEnabled = !ChargingMonitorService.running && !busy
                 permissionNotification?.checked = notificationsAllowed()
                 permissionBackground?.checked = getSystemService(android.os.PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
             }
@@ -394,14 +553,15 @@ class MainActivity : Activity() {
         if (!::ui.isInitialized) return
         val notifications = notificationsAllowed()
         val background = getSystemService(android.os.PowerManager::class.java).isIgnoringBatteryOptimizations(packageName)
+        onboarding?.update(onboardingModel())
+        ui.onboardingPending(onboardingStore.pending)
         ui.updateIdentity(device?.name, notifications, background)
-        ui.updateAccount(session != null, session?.region ?: selectedRegion, controls.cloudExpired)
+        ui.updateAccount(session != null, session?.let { !MainlandAccount.accepts(it) } == true, controls.cloudExpired)
         ui.updateSavedMode(controls.mode)
-        accountStatus.text = session?.let { "已保存云端会话 · ${it.region}（${if (controls.cloudExpired) "已失效，请重新登录" else "请求时校验有效性"}）" } ?: "尚未取得云端会话"
+        accountStatus.text = session?.let { if (!MainlandAccount.accepts(it)) MainlandAccount.LOGIN_REQUIRED else "已保存云端会话 · 中国大陆（${if (controls.cloudExpired) "已失效，请重新登录" else "请求时校验有效性"}）" } ?: "尚未取得云端会话"
         deviceStatus.text = device?.let { "${it.name}\n${it.model}\n局域网 IP：${it.ip}\nToken：已获取并加密保存" } ?: "尚未选择插座"
     }
     private fun smsLogin() {
-        val region = selectedRegion
         busy = true
         updateProtection()
         record("正在准备手机号登录…")
@@ -411,55 +571,20 @@ class MainActivity : Activity() {
             updateProtection()
             pendingLogin = null
             account = XiaomiAccountRepository()
-            task("准备手机号登录", { account.beginSms(region) }, ::loginStep)
-        }
-    }
-    private fun loginDialog() {
-        sheet("password-login", "登录小米账号", true) { panel ->
-            val user = panel.field("小米账号 / 手机号码", "", "login-user")
-            val password = panel.field("密码", "", "login-password", secret = true)
-            val error = panel.note("请输入账号和密码").apply { visibility = View.GONE; setTextColor(Fluent.red) }
-            panel.note("仅向小米 HTTPS 服务发送登录请求，可能需要验证码或身份验证。")
-            panel.action("登录", "password-submit") {
-                editableAction {
-                    val username = user.text.toString().trim(); val secret = password.text.toString()
-                    if (username.isEmpty() || secret.isEmpty()) { error.visibility = View.VISIBLE; return@editableAction }
-                    val region = selectedRegion
-                    password.text.clear(); panel.dismiss(); clearWebCookies(); pendingLogin = null; account = XiaomiAccountRepository()
-                    task("小米账号登录", { account.begin(username, secret, region) }, ::loginStep)
-                }
-            }
+            task("准备手机号登录", { account.beginSms() }, ::loginStep)
         }
     }
     private fun loginStep(step: LoginStep) {
         pendingLogin = if (step is LoginStep.Success) null else step
+        onboarding?.update(onboardingModel())
         when (step) {
             is LoginStep.Success -> task("保存账号会话", { store.put("session", step.session.json()); step.session }) {
+                availableDevices = emptyList(); devicesLoaded = false
                 session = it; controls.cloudExpired = false; updateLabels(); updateRouteLabel(); clearWebCookies(); loadDevices()
             }
-            is LoginStep.Captcha -> {
-                val bitmap = android.graphics.BitmapFactory.decodeByteArray(step.image, 0, step.image.size)
-                if (bitmap == null) { record("验证码图片无法解析，请重新登录"); return }
-                sheet("captcha", "图形验证码", true) { panel ->
-                    panel.body.addView(ImageView(this).apply { setImageBitmap(bitmap); adjustViewBounds = true })
-                    val code = panel.field("图形验证码", "", "captcha-code")
-                    panel.action("提交", "captcha-submit") { editableAction {
-                        val value = code.text.toString().trim(); code.text.clear(); panel.dismiss()
-                        task("提交图形验证码", { account.authenticate(value) }, ::loginStep)
-                    } }
-                }
-            }
             is LoginStep.Verification -> sheet("verification", "小米要求身份验证", true) { panel ->
-                panel.note("请在小米网页完成验证；也可尝试当前会话的短信 / 邮件验证码。")
-                panel.action("打开验证网页", "verification-web") { panel.dismiss(); openVerification(step.url) }
-                panel.action("获取验证码", "verification-otp", false) { editableAction { panel.dismiss(); task("发送验证码", { account.sendOtp() }, ::loginStep) } }
-            }
-            is LoginStep.Otp -> sheet("otp", "输入当前会话验证码", true) { panel ->
-                val field = panel.field("${step.method}验证码", "", "otp-code").apply { inputType = InputType.TYPE_CLASS_NUMBER }
-                panel.action("提交", "otp-submit") { editableAction {
-                    val code = field.text.toString().trim(); field.text.clear(); panel.dismiss()
-                    task("验证验证码", { account.submitOtp(code) }, ::loginStep)
-                } }
+                panel.note("请在小米官方网页按提示完成身份验证，完成后继续登录。")
+                panel.action("打开验证网页", "verification-web") { editableAction { panel.dismiss(); openVerification(step.url) } }
             }
             is LoginStep.SmsWeb -> openVerification(step.url, smsLogin = true)
         }
@@ -489,20 +614,21 @@ class MainActivity : Activity() {
     }
     private fun loadDevices() {
         val saved = session ?: run { record("请先登录小米账号"); return }
-        val current = saved.copy(region = selectedRegion)
-        task("获取设备列表", {
-            val devices = account.devices(current)
-            store.put("session", current.json())
-            devices
-        }) { devices ->
-            session = current; controls.cloudExpired = false; updateLabels(); updateRouteLabel()
-            if (devices.isEmpty()) { record("该地区暂无设备，请核对米家地区和账号"); return@task }
-            availableDevices = devices
-            devicesDialog()
-        }
+        if (!MainlandAccount.accepts(saved)) { record(MainlandAccount.LOGIN_REQUIRED); return }
+        onboardingListError = null
+        task("获取设备列表", { account.devices(saved) }, { devices ->
+            controls.cloudExpired = false
+            availableDevices = DeviceSupport.filter(devices); devicesLoaded = true
+            updateLabels(); updateRouteLabel()
+            if (onboarding == null) devicesDialog()
+        }, {
+            onboardingListError = lastTaskError ?: "获取失败，请检查网络后重试"
+            onboarding?.update(onboardingModel())
+        })
     }
+
     private fun deviceDialog(existing: PlugDevice?) {
-        sheet("edit-device", "编辑设备凭据", true) { panel ->
+        sheet("edit-device", if (onboarding != null) "手动导入设备" else "编辑设备凭据", true) { panel ->
             val name = panel.field("设备名称", existing?.name ?: "米家智能插座 3", "device-name")
             val ip = panel.field("局域网 IP", existing?.ip.orEmpty(), "device-ip").apply { inputType = InputType.TYPE_CLASS_PHONE }
             val token = panel.field("设备 Token", existing?.token.orEmpty(), "device-token", secret = true)
@@ -512,10 +638,15 @@ class MainActivity : Activity() {
                 editableAction {
                     val config = PlugDevice(name.text.toString().trim().ifBlank { "米家智能插座 3" }, "cuco.plug.v3",
                         existing?.did.orEmpty(), ip.text.toString().trim(), token.text.toString().trim())
-                    try { PlugAccess.validate(this, config) } catch (e: Exception) { error.text = safeMessage(e); error.visibility = View.VISIBLE; return@editableAction }
+                    try {
+                        if (config.ip.isNotBlank() || config.token.isNotBlank()) MiioLanClient.validate(config)
+                        else PlugAccess.validate(this, config)
+                    } catch (e: Exception) { error.text = safeMessage(e); error.visibility = View.VISIBLE; return@editableAction }
                     token.text.clear(); panel.dismiss()
                     task("加密保存设备凭据", { store.put("device", config.json()); config }) {
-                        device = it; result.text = "状态：配置已更新，待查询"; ui.showPlug(null, "配置已更新，点击刷新确认"); updateLabels()
+                        device = it; result.text = "状态：配置已更新，待查询"; ui.showPlug(null, "配置已更新，点击刷新确认")
+                        if (onboarding != null) { onboardingStore.manual = true; onboardingStore.mode = ControlMode.LAN; onboarding?.go("device") }
+                        updateLabels()
                     }
                 }
             }
@@ -556,6 +687,7 @@ class MainActivity : Activity() {
                 busy = false; updateProtection()
                 outcome.fold({ record("$label：完成"); success(it) }, {
                     if (it is CloudAuthException) { controls.cloudExpired = true; updateLabels() }
+                    lastTaskError = safeMessage(it)
                     updateRouteLabel(); record("$label：${safeMessage(it)}"); failure()
                 })
             }
@@ -576,7 +708,7 @@ class MainActivity : Activity() {
         logs.addFirst("$time  $message"); while (logs.size > 30) logs.removeLast()
         if (::logView.isInitialized) logView.text = logs.joinToString("\n")
         if (::operationStatus.isInitialized) operationStatus.text = message
-        if (::ui.isInitialized) { ui.updateLogs(logs.toList()); ui.toast(message.substringBefore('\n')) }
+        if (::ui.isInitialized) { ui.updateLogs(logs.toList()); if (onboarding == null) ui.toast(message.substringBefore('\n')) else onboarding?.showMessage(message) }
     }
     private fun clearWebCookies(complete: (() -> Unit)? = null) {
         android.webkit.WebStorage.getInstance().deleteAllData()

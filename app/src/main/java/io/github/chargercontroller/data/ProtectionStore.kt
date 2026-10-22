@@ -9,6 +9,18 @@ class ProtectionStore(context: Context) {
     var threshold: Int
         get() = prefs.getInt("threshold", 80).coerceIn(2, 100)
         set(value) { require(value in 2..100); check(prefs.edit().putInt("threshold", value).commit()) }
+    var resumeOnBoot: Boolean
+        get() = prefs.getBoolean("resume_on_boot", true)
+        set(value) { check(prefs.edit().putBoolean("resume_on_boot", value).commit()) }
+    val resumePending get() = prefs.getBoolean("resume_pending", false)
+    val resumeMessage get() = prefs.getString("resume_message", "").orEmpty()
+    /** Keep the persisted phase and retry budget intact while waiting for a fresh state read. */
+    fun resuming(message: String) {
+        check(prefs.edit().putBoolean("resume_pending", true).putString("resume_message", message).commit())
+    }
+    fun clearResume() {
+        check(prefs.edit().putBoolean("resume_pending", false).remove("resume_message").commit())
+    }
     val active get() = prefs.getBoolean("active", false)
     val lowerThreshold get() = prefs.getInt("lower_threshold", 30).coerceIn(1, 99)
     fun configure(high: Int, low: Int) {
@@ -25,7 +37,7 @@ class ProtectionStore(context: Context) {
     val roundPercent get() = prefs.getInt("round_percent", -1).takeIf { it in 0..100 }
     val offRequested get() = prefs.getBoolean("off_requested", false)
     val attempts get() = prefs.getInt("attempts", 0)
-    val message get() = prefs.getString("message", "尚未开始充电保护")!!
+    val message get() = prefs.getString("message", "尚未开始电量循环保护")!!
     val updatedAt get() = prefs.getLong("updated_at", 0)
     val sampledAt get() = prefs.getLong("sampled_at", 0)
     val sampleSource get() = prefs.getString("sample_source", "尚未采样")!!
@@ -43,6 +55,6 @@ class ProtectionStore(context: Context) {
             .putInt("percent", cycle.percent ?: -1).putInt("attempts", cycle.attempts)
             .putString("message", message).putLong("updated_at", System.currentTimeMillis()).commit())
     }
-    fun interrupt() { check(prefs.edit().putBoolean("active", false).putString("phase", "INTERRUPTED")
+    fun interrupt() { clearResume(); check(prefs.edit().putBoolean("active", false).putString("phase", "INTERRUPTED")
         .putString("message", "上次保护已中断，当前未运行；请重新开始").putLong("updated_at", System.currentTimeMillis()).commit()) }
 }

@@ -3,6 +3,7 @@ package io.github.chargercontroller.network
 import android.net.Network
 import io.github.chargercontroller.core.MiioCodec
 import io.github.chargercontroller.core.LocalUnavailableException
+import io.github.chargercontroller.data.DeviceSupport
 import io.github.chargercontroller.data.PlugDevice
 import io.github.chargercontroller.data.PlugStatus
 import io.github.chargercontroller.data.UserFacingException
@@ -19,7 +20,7 @@ class MiioLanClient(private val network: Network?) : PlugClient {
         private val sequence = AtomicInteger((System.nanoTime() and 0xffff).toInt())
         fun validate(device: PlugDevice) {
             MiioCodec.token(device.token)
-            require(device.model == "cuco.plug.v3") { "本版仅支持 cuco.plug.v3，请核对型号" }
+            DeviceSupport.requireSupported(device)
             val parts = device.ip.split('.')
             require(parts.size == 4 && parts.all { it.isNotEmpty() && it.toIntOrNull() in 0..255 }) { "请输入有效的 IPv4 地址" }
             val numbers = parts.map { it.toInt() }

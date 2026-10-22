@@ -12,7 +12,7 @@ fun interface CloudRequest { fun call(path: String, data: JSONObject): JSONObjec
 /** Reuses the proven RC4 session transport. Never logs payloads, cookies or decrypted responses. */
 class XiaomiCloudApi(private val http: XiaomiHttp = XiaomiHttp(8000, 10000)) {
     fun request(session: CloudSession, path: String, data: JSONObject): JSONObject {
-        require(session.region in XiaomiAccountRepository.REGIONS) { "云端地区无效，请重新登录" }
+        MainlandAccount.requireSession(session)
         require(path == "/home/device_list" || path.matches(Regex("/home/rpc/[0-9]{1,32}"))) { "不支持的云端请求" }
         if (Thread.currentThread().isInterrupted) throw InterruptedException()
         require(session.userId.matches(Regex("[0-9]+")) &&
@@ -21,7 +21,7 @@ class XiaomiCloudApi(private val http: XiaomiHttp = XiaomiHttp(8000, 10000)) {
             ByteBuffer.allocate(4).putInt((System.currentTimeMillis() / 60000).toInt()).array())
         val fields = try { CloudRc4.fields(path, data.toString(), session.security, nonce) }
             catch (_: IllegalArgumentException) { throw CloudAuthException("保存的云端加密凭据无效，请重新登录") }
-        val host = (if (session.region == "cn") "" else "${session.region}.") + "api.io.mi.com"
+        val host = "api.io.mi.com"
         val cookies = "userId=${session.userId}; serviceToken=${session.serviceToken}; yetAnotherServiceToken=${session.serviceToken}; locale=zh_CN; PassportDeviceId=${session.deviceId}"
         val reply = http.post("https://$host/app$path", fields, XiaomiHttp.CLOUD_UA, cookies,
             mapOf("MIOT-ENCRYPT-ALGORITHM" to "ENCRYPT-RC4", "Accept-Encoding" to "identity",

@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -9,7 +10,7 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <application
-        android:label="插座充电控制"
+        android:label="充电守护"
         android:theme="@style/AppTheme"
         android:allowBackup="false"
         android:fullBackupContent="false"
@@ -17,6 +18,11 @@
         android:icon="@drawable/ic_launcher"
         android:supportsRtl="true"
         android:usesCleartextTraffic="false">
+        <receiver android:name=".ProtectionBootReceiver" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
         <receiver android:name=".ProtectionCheckReceiver" android:exported="false" />
         <service android:name=".ChargingMonitorService" android:exported="false"
             android:foregroundServiceType="connectedDevice" android:stopWithTask="false" />

@@ -10,7 +10,7 @@ object PlugAccess {
     /** Shared by manual control and the protection service. */
     val lock = Any()
     fun validate(context: Context, device: PlugDevice, mode: ControlMode = ControlPreferences(context).mode) {
-        require(device.model == "cuco.plug.v3") { "本版仅支持 cuco.plug.v3" }
+        DeviceSupport.requireSupported(device)
         when (mode) {
             ControlMode.LAN -> MiioLanClient.validate(device)
             ControlMode.CLOUD -> XiaomiCloudClient.validate(device)
@@ -23,6 +23,7 @@ object PlugAccess {
             if (prefs.cloudExpired) throw CloudAuthException()
             val saved = CredentialStore(context).get("session")?.let(CloudSession::fromJson)
                 ?: throw UserFacingException("云端控制需要小米账号会话，请先登录")
+            MainlandAccount.requireSession(saved)
             val cloud = XiaomiCloudClient(saved)
             object : PlugClient {
                 private fun <T> guarded(block: () -> T): T = try { block() } catch (e: CloudAuthException) { prefs.cloudExpired = true; throw e }
