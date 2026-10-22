@@ -19,6 +19,10 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     buildTypes {
-        release { isMinifyEnabled = false }
+        release {
+            isMinifyEnabled = false
+            isDebuggable = false
+            signingConfig = signingConfigs.getByName("debug")
+        }
     }
 }
